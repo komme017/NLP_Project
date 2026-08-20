@@ -12,7 +12,7 @@ setup, running it, and what's been validated so far.
 ```bash
 pip install -r requirements.txt
 cp .env.example .env   # fill in your Azure OpenAI endpoint/key
-streamlit run app.py
+streamlit run app_2.py
 ```
 
 Required environment variables (see `.env.example`):
