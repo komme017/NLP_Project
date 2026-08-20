@@ -1,143 +1,87 @@
-"""Clause classification: assign each clause one category from a fixed
-taxonomy by prompting the model. Clauses are batched into a single call
-where possible to cut cost and latency.
+"""Clause classification using a RoBERTa model fine-tuned on CUAD, run as
+extractive QA: for each of the 41 CUAD categories, ask whether the contract
+contains that clause type, and if so, where. Explanations/redlines are
+still generated separately by GPT-4.1-mini in analyze.py — this module only
+replaces *detection*, not the natural-language reasoning layer.
 """
 
-import json
 import logging
 
+from transformers import AutoModelForQuestionAnswering, AutoTokenizer, pipeline
+
 from baselines import CATEGORIES
-from llm_client import get_client, get_deployment
-from parsing import extract_json
 
 logger = logging.getLogger(__name__)
 
-BATCH_SIZE = 8
-# Classification only needs to recognize the clause type, not reason over
-# every word — truncating keeps batched prompts small. Full clause text is
-# preserved elsewhere for the analysis stage.
-CLASSIFY_CHARS = 600
+MODEL_NAME = "akdeniz27/roberta-base-cuad"  # swap for "Rakib/roberta-base-on-cuad" if preferred
+CONFIDENCE_THRESHOLD = 0.5  # tune based on false-positive/negative tradeoff you observe
 
-SYSTEM_PROMPT = (
-    "You are a contract clause classifier for a legal review tool. "
-    "Assign each clause exactly one category from this fixed list, and "
-    "nothing else:\n"
-    + "\n".join(f"- {c}" for c in CATEGORIES)
-    + "\nIf a clause does not clearly fit one of the specific categories, "
-    "use \"Other\". Respond with ONLY the requested JSON, no commentary, "
-    "no markdown fences."
-)
+_qa_pipeline = None  # lazy-loaded singleton so the model is only loaded once per process
 
 
-def _chunks(items, size):
-    for i in range(0, len(items), size):
-        yield items[i : i + size]
-
-
-def _classify_batch(batch, cost_tracker=None) -> dict:
-    payload = [
-        {
-            "clause_id": c["clause_id"],
-            "heading": c["heading"],
-            "text": c["text"][:CLASSIFY_CHARS],
-        }
-        for c in batch
-    ]
-    user_prompt = (
-        "Classify each of these clauses. Return a JSON object mapping each "
-        "clause_id to its category string, e.g. "
-        '{"c1": "Termination", "c2": "Other"}.\n\n'
-        f"Clauses:\n{json.dumps(payload, indent=2)}"
-    )
-
-    client = get_client()
-    deployment = get_deployment()
-    response = client.chat.completions.create(
-        model=deployment,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt},
-        ],
-        temperature=0,
-    )
-
-    if cost_tracker is not None:
-        usage = response.usage
-        cost_tracker.log_call(
-            stage="classify",
-            model=deployment,
-            prompt_tokens=usage.prompt_tokens,
-            completion_tokens=usage.completion_tokens,
+def _get_pipeline():
+    global _qa_pipeline
+    if _qa_pipeline is None:
+        logger.info("Loading CUAD QA model %s...", MODEL_NAME)
+        model = AutoModelForQuestionAnswering.from_pretrained(MODEL_NAME)
+        tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+        _qa_pipeline = pipeline(
+            "question-answering",
+            model=model,
+            tokenizer=tokenizer,
+            handle_impossible_answer=True,  # lets the model say "no answer" instead of forcing a span
         )
-
-    raw = response.choices[0].message.content
-    try:
-        parsed = extract_json(raw)
-        if not isinstance(parsed, dict):
-            raise ValueError("expected a JSON object")
-        return parsed
-    except (json.JSONDecodeError, ValueError):
-        logger.warning("classify: could not parse batch response, will retry per-clause: %r", raw)
-        return {}
+    return _qa_pipeline
 
 
-def _classify_single(clause, cost_tracker=None):
-    """Retry path for a clause that came back with an invalid/missing
-    category. Asks for just the bare category name."""
-    user_prompt = (
-        "Classify this single contract clause. Reply with ONLY the category "
-        "name from the list, nothing else.\n\n"
-        f"Heading: {clause['heading']}\n"
-        f"Text: {clause['text'][:CLASSIFY_CHARS]}"
+def _cuad_question(category: str) -> str:
+    """CUAD's own question template — matches how the model was trained,
+    which matters for QA models since prompt phrasing affects accuracy."""
+    return (
+        f'Highlight the parts (if any) of this contract related to '
+        f'"{category}" that should be reviewed by a lawyer.'
     )
-    client = get_client()
-    deployment = get_deployment()
-    response = client.chat.completions.create(
-        model=deployment,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt},
-        ],
-        temperature=0,
-    )
-
-    if cost_tracker is not None:
-        usage = response.usage
-        cost_tracker.log_call(
-            stage="classify_retry",
-            model=deployment,
-            prompt_tokens=usage.prompt_tokens,
-            completion_tokens=usage.completion_tokens,
-        )
-
-    raw = response.choices[0].message.content.strip()
-    for category in CATEGORIES:
-        if raw.lower() == category.lower():
-            return category
-    return None
 
 
 def classify_clauses(clauses, cost_tracker=None) -> dict:
-    """Return {clause_id: category} for every clause. Unparseable or
-    off-taxonomy responses fall back to a single-clause retry, then to
-    "Other" — never left unclassified and never allowed to crash the run."""
+    """Return {clause_id: category}, using the CUAD QA model instead of an
+    LLM prompt. For each clause, run all 41 category-questions against its
+    own text and keep the highest-confidence match above threshold; if none
+    clears the threshold, fall back to "Other". No API cost tracking here
+    since this runs locally — cost_tracker is accepted for interface
+    compatibility with the old classify_clauses but not used.
+    """
+    qa = _get_pipeline()
     results: dict = {}
-    for batch in _chunks(clauses, BATCH_SIZE):
-        batch_result = _classify_batch(batch, cost_tracker)
-        for clause_id, category in batch_result.items():
-            if category in CATEGORIES:
-                results[clause_id] = category
-            else:
-                logger.warning(
-                    "classify: batch returned off-taxonomy category %r for %s", category, clause_id
-                )
 
     for clause in clauses:
         cid = clause["clause_id"]
-        if cid not in results:
-            retried = _classify_single(clause, cost_tracker)
-            results[cid] = retried if retried in CATEGORIES else "Other"
-            if retried is None:
-                logger.warning("classify: %s could not be classified, defaulting to Other", cid)
+        context = clause["text"]
+
+        best_category = None
+        best_score = 0.0
+
+        for category in CATEGORIES:
+            question = _cuad_question(category)
+            try:
+                answer = qa(question=question, context=context)
+            except Exception as e:
+                logger.warning("classify: QA call failed for %s / %s: %s", cid, category, e)
+                continue
+
+            # handle_impossible_answer=True returns empty string + low score
+            # when the model thinks there's no match for this category
+            if answer["answer"] and answer["score"] > best_score:
+                best_score = answer["score"]
+                best_category = category
+
+        if best_category and best_score >= CONFIDENCE_THRESHOLD:
+            results[cid] = best_category
+        else:
+            results[cid] = "Other"
+            logger.info(
+                "classify: %s — no category cleared threshold (best=%s @ %.2f), defaulting to Other",
+                cid, best_category, best_score,
+            )
 
     return results

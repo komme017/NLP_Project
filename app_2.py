@@ -217,13 +217,26 @@ def render_flags_sidebar(run_output) -> str:
 def render_document(run_output, selected_id: str):
     results_by_id = {r["clause_id"]: r for r in run_output["results"]}
     st.markdown("**Document** (scroll, or pick a flag in the sidebar to jump)")
+
     doc_html = build_highlighted_document_html(
         run_output["text"], run_output["clauses"], results_by_id, selected_id
     )
-    st.markdown(doc_html, unsafe_allow_html=True)
-
+    scroll_script = ""
     if selected_id is not None:
-        scroll_to_clause(selected_id)
+        scroll_script = f"""
+        <script>
+        (function scrollWhenReady(tries) {{
+            var el = document.getElementById("clause-{selected_id}");
+            if (el) {{
+                el.scrollIntoView({{behavior: "smooth", block: "center"}});
+            }} else if (tries > 0) {{
+                setTimeout(function() {{ scrollWhenReady(tries - 1); }}, 100);
+            }}
+        }})(20);
+        </script>
+        """
+
+    components.html(doc_html + scroll_script, height=DOC_VIEW_HEIGHT_PX + 20, scrolling=True)
 
 
 def render_costs(cost_totals):
@@ -241,17 +254,49 @@ def render_costs(cost_totals):
 
 
 def main():
-    st.title("Redline — Document View")
+    st.title("Redline - Contract Review Assistant")
+    st.markdown(
+        """
+        <style>
+        [data-testid="stSidebar"] {
+            background-color: #001f3f;
+        }
+        [data-testid="stSidebar"] * {
+            color: #ffffff;
+        }
+        /* Selectbox closed control (the white dropdown box) */
+        [data-testid="stSidebar"] div[data-baseweb="select"] * {
+            color: #000000 !important;
+        }
+        /* Selectbox open dropdown list (renders outside the sidebar div) */
+        div[data-baseweb="popover"] li {
+            color: #000000 !important;
+        }
+        /* Suggested redline code block */
+        [data-testid="stSidebar"] code,
+        [data-testid="stSidebar"] pre,
+        [data-testid="stSidebar"] pre *,
+        [data-testid="stSidebar"] code * {
+            color: #000000 !important;
+        }
+        [data-testid="stSidebar"] [data-testid="stCodeBlock"],
+        [data-testid="stSidebar"] [data-testid="stCodeBlock"] * {
+            color: #000000 !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
     st.caption(
         "Upload an inbound third-party contract to see the full text with "
         "flagged clauses highlighted inline. Pick a flag from the sidebar "
         "dropdown to scroll the document to it."
     )
 
-    with st.expander("Taxonomy covered"):
+    with st.expander("Taxonomy Covered"):
         st.write(", ".join(CATEGORIES))
 
-    uploaded = st.file_uploader("Upload a contract", type=["txt", "pdf"])
+    uploaded = st.file_uploader("Upload Contract", type=["txt", "pdf"])
 
     if uploaded is not None and st.button("Analyze", type="primary"):
         file_bytes = uploaded.read()

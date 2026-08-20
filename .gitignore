@@ -7,3 +7,22 @@ runs.jsonl
 .streamlit/secrets.toml
 *.egg-info/
 .DS_Store
+# Environments
+env/
+*/envs/
+.conda/
+
+# Env variable files
+.env
+.env.local
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# Model cache (if huggingface cache ever lives in-repo)
+.cache/
+models/
