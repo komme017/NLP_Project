@@ -11,7 +11,9 @@ the answering span or (SQuAD2.0-style) says there's no answer. CUAD has 41
 of these fixed category-questions (see CUADv1.json in the repo above); a
 label per clause has to be reverse-engineered by running our candidate
 categories' questions against the clause and taking whichever one the model
-answers most confidently.
+answers most confidently. Explanations/redlines are still generated
+separately by gpt-4.1-mini in analyze.py — this module only replaces
+*detection*, not the natural-language reasoning layer.
 
 # NOTE: CUAD's 41 categories do not cover this product's taxonomy 1:1.
 # Only 5 of our 8 categories have a reasonable CUAD analog (see
@@ -26,15 +28,26 @@ answers most confidently.
 # this is why. (This is very likely what was actually happening if
 # *everything* showed up unclassified before — worth checking the 90%+
 # Other-rate warning logged below to rule out a genuine load failure too.)
+#
+# An earlier version of this module built its questions from our own
+# category names directly (e.g. literally asking about "Indemnification"
+# or "Payment Terms") instead of CUAD's actual training-question phrasing.
+# QA models are very sensitive to exact question wording, so those
+# mismatched questions scored near zero across the board and *everything*
+# fell through to "Other" -- this is almost certainly why classification
+# looked completely broken. CUAD_QUESTIONS below uses the verbatim question
+# text from CUADv1.json for the 5 categories that do have a real CUAD
+# analog, which is the actual fix.
 
 ## Why classification used to fail with everything unclassified
 
-The most common cause of every clause landing on "N/A"/"Other" is the model
-failing to load (wrong CUAD_MODEL_PATH, missing weights, missing torch) and
-that failure getting silently absorbed somewhere upstream. This module
-raises loudly instead — if the model can't load, classify_clauses raises
-RuntimeError with an actionable message rather than quietly returning
-"Other" for every clause and looking like a classification result.
+The other common cause of every clause landing on "N/A"/"Other" is the
+model failing to load (wrong model id/path, missing weights, missing
+torch) and that failure getting silently absorbed somewhere upstream. This
+module raises loudly instead — if the model can't load, classify_clauses
+raises RuntimeError with an actionable message rather than quietly
+returning "Other" for every clause and looking like a classification
+result.
 """
 
 import functools
@@ -45,13 +58,14 @@ from baselines import CATEGORIES
 
 logger = logging.getLogger(__name__)
 
-# Point this at wherever the actual checkpoint lives. The official weights
-# are distributed from Zenodo (linked in the repo's README); this sandbox's
-# network policy blocks both zenodo.org and huggingface.co, so the model
-# can't be fetched automatically here — download it wherever you have
-# network access and either point CUAD_MODEL_PATH at the local directory,
-# or set it to a Hugging Face Hub id if your environment can reach the Hub.
-CUAD_MODEL_PATH = os.environ.get("CUAD_MODEL_PATH", "./models/roberta-base-cuad")
+# Accepts either a Hugging Face Hub id or a local directory path. Defaults
+# to a community-hosted mirror of the CUAD checkpoint (the official weights
+# are only distributed via Zenodo, linked from the repo's README, with no
+# Hub mirror from the Atticus Project itself) -- "Rakib/roberta-base-on-cuad"
+# is a documented alternative if this one is ever unavailable. Override via
+# env var to point at a local directory (e.g. an extracted Zenodo download)
+# instead.
+CUAD_MODEL_PATH = os.environ.get("CUAD_MODEL_PATH", "akdeniz27/roberta-base-cuad")
 
 # clause text this long already gives the QA model enough context; the
 # pipeline's own doc_stride/max_seq_len handle anything longer via sliding
@@ -113,13 +127,13 @@ OTHER_RATE_WARNING_THRESHOLD = 0.9
 def _load_pipeline():
     from transformers import pipeline
 
-    # If CUAD_MODEL_PATH looks like a local path (the default is), a missing
-    # directory should fail immediately -- letting transformers/huggingface_hub
-    # treat it as a Hub id instead means a network resolution attempt with
-    # its own retry/backoff, which can hang for minutes in an environment
-    # with no route to huggingface.co before finally producing the same
-    # "not found" conclusion. Only genuine Hub ids (no local-path prefix)
-    # fall through to the real network attempt below.
+    # If CUAD_MODEL_PATH looks like a local path, a missing directory
+    # should fail immediately -- letting transformers/huggingface_hub treat
+    # it as a Hub id instead means a network resolution attempt with its
+    # own retry/backoff, which can hang for minutes in an environment with
+    # no route to huggingface.co before finally producing the same "not
+    # found" conclusion. Only genuine Hub ids (no local-path prefix) fall
+    # through to the real network attempt below.
     looks_like_local_path = CUAD_MODEL_PATH.startswith((".", "/", "~"))
     if looks_like_local_path and not os.path.isdir(CUAD_MODEL_PATH):
         raise RuntimeError(

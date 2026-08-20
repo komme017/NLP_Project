@@ -12,7 +12,7 @@ setup, running it, and what's been validated so far.
 ```bash
 pip install -r requirements.txt
 cp .env.example .env   # fill in your Azure OpenAI endpoint/key
-streamlit run app.py
+streamlit run app_2.py
 ```
 
 Required environment variables (see `.env.example`) — only needed for
@@ -26,8 +26,9 @@ AZURE_OPENAI_DEPLOYMENT   # gpt-4.1-mini
 AZURE_OPENAI_API_VERSION  # 2024-10-21
 ```
 
-`classify.py` additionally needs a local CUAD-fine-tuned RoBERTa checkpoint
-— see **Classification model** below.
+`classify.py` additionally needs to reach a CUAD-fine-tuned RoBERTa
+checkpoint (Hugging Face Hub by default, or a local directory) — see
+**Classification model** below.
 
 ## Two UI variants
 
@@ -95,24 +96,30 @@ on "Other" (expected on a contract heavy with those three categories;
 worth double-checking the model actually loaded if it looks too high on a
 more varied contract).
 
-**Getting an all-"Other"/N/A result for every clause almost always means
-the model failed to load**, not that classification is running and
-finding nothing. `classify.py` used to (before this change) have no local
-model at all, so if the previous state showed nothing classifying, the
-most likely explanation is exactly that: a broken model load silently
-producing the same fallback everywhere. This version raises `RuntimeError`
-loudly instead of swallowing that into an all-Other result — `app.py`/
-`app_2.py` catch it and show the actual error in the UI. Point
-`CUAD_MODEL_PATH` (env var, defaults to `./models/roberta-base-cuad`) at a
-local directory containing the downloaded checkpoint, or a Hugging Face
-Hub id your environment can reach.
+**Getting an all-"Other"/N/A result for every clause has two known
+causes**, both fixed in this version but worth knowing about directly:
+1. An earlier version built its questions from our own category names
+   directly (e.g. literally asking about `"Indemnification"`) instead of
+   CUAD's actual training-question phrasing. QA models are very sensitive
+   to exact question wording, so those mismatched questions scored near
+   zero across the board and *everything* fell through to `"Other"`. Fixed
+   by using CUAD's verbatim question text (see `CUAD_QUESTIONS`).
+2. The model silently failing to load, with every clause falling back to
+   `"Other"` and no visible signal that anything was wrong. Fixed by
+   raising `RuntimeError` loudly instead — `app.py`/`app_2.py` catch it and
+   show the actual error in the UI rather than a silent all-Other result.
+
+`CUAD_MODEL_PATH` (env var) controls which checkpoint loads — defaults to
+the Hugging Face Hub mirror `akdeniz27/roberta-base-cuad`
+(`Rakib/roberta-base-on-cuad` is a documented alternative), or point it at
+a local directory containing a Zenodo download instead.
 
 **This sandbox cannot download the actual checkpoint to verify any of the
 above against real weights.** The official checkpoint is distributed via
-Zenodo (linked from the CUAD repo's README); this environment's network
-policy blocks both `zenodo.org` and `huggingface.co` outright (confirmed —
-same block that stops `pip install`-style Hub downloads generally). What's
-verified here instead:
+Zenodo (linked from the CUAD repo's README), and this environment's
+network policy blocks both `zenodo.org` and `huggingface.co` outright —
+so neither the default Hub mirror nor a manual Zenodo download can be
+fetched here. What's verified here instead:
 - The adapter logic (confidence thresholding, multi-question OR-ing per
   category, the three unsupported categories being structurally
   unreachable, the loud-failure-on-load-error path) against a mocked QA

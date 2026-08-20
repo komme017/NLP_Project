@@ -251,17 +251,49 @@ def render_costs(cost_totals):
 
 
 def main():
-    st.title("Redline — Document View")
+    st.title("Redline - Contract Review Assistant")
+    st.markdown(
+        """
+        <style>
+        [data-testid="stSidebar"] {
+            background-color: #001f3f;
+        }
+        [data-testid="stSidebar"] * {
+            color: #ffffff;
+        }
+        /* Selectbox closed control (the white dropdown box) */
+        [data-testid="stSidebar"] div[data-baseweb="select"] * {
+            color: #000000 !important;
+        }
+        /* Selectbox open dropdown list (renders outside the sidebar div) */
+        div[data-baseweb="popover"] li {
+            color: #000000 !important;
+        }
+        /* Suggested redline code block */
+        [data-testid="stSidebar"] code,
+        [data-testid="stSidebar"] pre,
+        [data-testid="stSidebar"] pre *,
+        [data-testid="stSidebar"] code * {
+            color: #000000 !important;
+        }
+        [data-testid="stSidebar"] [data-testid="stCodeBlock"],
+        [data-testid="stSidebar"] [data-testid="stCodeBlock"] * {
+            color: #000000 !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
     st.caption(
         "Upload an inbound third-party contract to see the full text with "
         "flagged clauses highlighted inline. Pick a flag from the sidebar "
         "dropdown to scroll the document to it."
     )
 
-    with st.expander("Taxonomy covered"):
+    with st.expander("Taxonomy Covered"):
         st.write(", ".join(CATEGORIES))
 
-    uploaded = st.file_uploader("Upload a contract", type=["txt", "pdf"])
+    uploaded = st.file_uploader("Upload Contract", type=["txt", "pdf"])
 
     if uploaded is not None and st.button("Analyze", type="primary"):
         file_bytes = uploaded.read()
