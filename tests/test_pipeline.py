@@ -79,35 +79,38 @@ class TestSegment(unittest.TestCase):
             self.assertLessEqual(a["end"], b["start"])
 
 
-class FakeQAPipeline:
-    """Stand-in for the transformers QA pipeline. Matched by substring
-    against the (verbatim CUAD) question text, so tests don't have to
-    reproduce the full question strings — just enough to identify which
-    CUAD category question is being asked."""
+def fake_answer_question(rules):
+    """Stand-in for classify._answer_question. Matched by substring against
+    the (verbatim CUAD) question text, so tests don't have to reproduce the
+    full question strings — just enough to identify which CUAD category
+    question is being asked. rules: list of (question_substring, answer,
+    score)."""
 
-    def __init__(self, rules):
-        # rules: list of (question_substring, answer, score)
-        self.rules = rules
-
-    def __call__(self, question, context, handle_impossible_answer=True):
-        for substr, answer, score in self.rules:
+    def _fake(question, context, tokenizer, model):
+        for substr, answer, score in rules:
             if substr in question:
-                return {"answer": answer, "score": score, "start": 0, "end": len(answer)}
-        return {"answer": "", "score": 0.0, "start": 0, "end": 0}
+                return answer, score
+        return "", 0.0
+
+    return _fake
 
 
 class TestClassify(unittest.TestCase):
     def test_confident_match_assigns_mapped_category(self):
         clauses = [{"clause_id": "c1", "heading": "Gov Law", "text": "x" * 250}]
-        pipeline = FakeQAPipeline([("Governing Law", "Delaware law applies", 0.92)])
-        with patch("classify._load_pipeline", return_value=pipeline):
+        fake = fake_answer_question([("Governing Law", "Delaware law applies", 0.92)])
+        with patch("classify._load_model", return_value=(None, None)), patch(
+            "classify._answer_question", side_effect=fake
+        ):
             result = classify.classify_clauses(clauses)
         self.assertEqual(result, {"c1": "Governing Law"})
 
     def test_below_confidence_threshold_falls_to_other(self):
         clauses = [{"clause_id": "c1", "heading": "Ambiguous", "text": "x" * 250}]
-        pipeline = FakeQAPipeline([("Governing Law", "maybe Delaware", 0.2)])
-        with patch("classify._load_pipeline", return_value=pipeline):
+        fake = fake_answer_question([("Governing Law", "maybe Delaware", 0.2)])
+        with patch("classify._load_model", return_value=(None, None)), patch(
+            "classify._answer_question", side_effect=fake
+        ):
             result = classify.classify_clauses(clauses)
         self.assertEqual(result, {"c1": "Other"})
 
@@ -115,8 +118,10 @@ class TestClassify(unittest.TestCase):
         # "Limitation of Liability" maps to two CUAD questions (Cap On
         # Liability, Uncapped Liability) OR'd together
         clauses = [{"clause_id": "c1", "heading": "Liability", "text": "x" * 250}]
-        pipeline = FakeQAPipeline([("Uncapped Liability", "no cap stated", 0.75)])
-        with patch("classify._load_pipeline", return_value=pipeline):
+        fake = fake_answer_question([("Uncapped Liability", "no cap stated", 0.75)])
+        with patch("classify._load_model", return_value=(None, None)), patch(
+            "classify._answer_question", side_effect=fake
+        ):
             result = classify.classify_clauses(clauses)
         self.assertEqual(result, {"c1": "Limitation of Liability"})
 
@@ -134,7 +139,7 @@ class TestClassify(unittest.TestCase):
 
     def test_model_load_failure_raises_instead_of_silently_defaulting_everyone_to_other(self):
         clauses = [{"clause_id": "c1", "heading": "Anything", "text": "x" * 250}]
-        with patch("classify._load_pipeline", side_effect=RuntimeError("could not load model")):
+        with patch("classify._load_model", side_effect=RuntimeError("could not load model")):
             with self.assertRaises(RuntimeError):
                 classify.classify_clauses(clauses)
 

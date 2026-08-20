@@ -48,13 +48,29 @@ module raises loudly instead — if the model can't load, classify_clauses
 raises RuntimeError with an actionable message rather than quietly
 returning "Other" for every clause and looking like a classification
 result.
+
+## Why this doesn't use transformers.pipeline("question-answering", ...)
+
+That's the normal way to run extractive QA, but "question-answering" isn't
+a registered pipeline task in every transformers version -- it's absent
+from some installs' supported-task list entirely (confirmed against a real
+install: KeyError listing table-question-answering and
+document-question-answering as the only QA-flavored tasks available, no
+plain extractive one). Rather than depend on that pipeline convenience
+wrapper, this module drives AutoModelForQuestionAnswering/AutoTokenizer
+directly and does its own start/end-span decoding -- those model/tokenizer
+classes are far more fundamental and stable across versions than the
+pipeline task registry sitting on top of them.
 """
 
 import functools
 import logging
+import math
 import os
 
+import torch
 from dotenv import load_dotenv
+from transformers import AutoModelForQuestionAnswering, AutoTokenizer
 
 from baselines import CATEGORIES
 
@@ -76,10 +92,23 @@ logger = logging.getLogger(__name__)
 # instead.
 CUAD_MODEL_PATH = os.environ.get("CUAD_MODEL_PATH", "akdeniz27/roberta-base-cuad")
 
-# clause text this long already gives the QA model enough context; the
-# pipeline's own doc_stride/max_seq_len handle anything longer via sliding
-# windows, this just keeps very large clauses from being needlessly slow.
+# clause text this long already gives the QA model enough context to work
+# with; kept well under MAX_SEQ_LEN in *characters* so truncation to
+# MAX_SEQ_LEN *tokens* below rarely has to cut anything real off.
 MAX_CONTEXT_CHARS = 4000
+
+# CUAD's own training truncates to this many tokens (question + context
+# combined). Clauses are already segmented (far shorter than a full
+# contract, which is what CUAD's sliding-window/doc_stride handling is
+# for), so a single truncated pass is enough here -- no need to reproduce
+# the multi-window stitching CUAD's own eval script does for full
+# documents.
+MAX_SEQ_LEN = 384
+
+# a span longer than this is almost certainly the model latching onto
+# something wrong rather than a real answer -- caps the O(n * k) search
+# below and matches typical SQuAD-style postprocessing.
+MAX_ANSWER_TOKENS = 60
 
 # category -> one or more CUAD question strings (verbatim from CUADv1.json,
 # since exact phrasing is what the model was trained on). Multiple
@@ -133,9 +162,7 @@ OTHER_RATE_WARNING_THRESHOLD = 0.9
 
 
 @functools.lru_cache(maxsize=1)
-def _load_pipeline():
-    from transformers import pipeline
-
+def _load_model():
     # If CUAD_MODEL_PATH looks like a local path, a missing directory
     # should fail immediately -- letting transformers/huggingface_hub treat
     # it as a Hub id instead means a network resolution attempt with its
@@ -153,7 +180,10 @@ def _load_pipeline():
         )
 
     try:
-        return pipeline("question-answering", model=CUAD_MODEL_PATH, tokenizer=CUAD_MODEL_PATH)
+        tokenizer = AutoTokenizer.from_pretrained(CUAD_MODEL_PATH)
+        model = AutoModelForQuestionAnswering.from_pretrained(CUAD_MODEL_PATH)
+        model.eval()
+        return tokenizer, model
     except Exception as e:
         raise RuntimeError(
             f"Could not load the CUAD QA model from CUAD_MODEL_PATH={CUAD_MODEL_PATH!r}: {e}. "
@@ -163,7 +193,68 @@ def _load_pipeline():
         ) from e
 
 
-def _classify_one(clause: dict, qa_pipeline) -> str:
+def _answer_question(question: str, context: str, tokenizer, model) -> tuple:
+    """Run one (question, context) pair directly through the model and
+    decode the best answer span ourselves -- see module docstring for why
+    this doesn't go through transformers.pipeline("question-answering").
+
+    Returns (answer_text, confidence). answer_text is "" when the model
+    prefers "no answer" (SQuAD2.0-style null-answer handling, matching how
+    CUAD's checkpoint was trained): the <s>/[CLS] token at position 0 is
+    the conventional null-answer slot, so a real span only wins if it
+    outscores that position. confidence is sigmoid(best_span_score -
+    null_score) -- roughly comparable to (but not numerically identical
+    to) the confidence transformers.pipeline used to report; 0.5 means
+    "exactly as confident as no answer at all", which is what
+    CONFIDENCE_THRESHOLD is calibrated against.
+    """
+    inputs = tokenizer(
+        question,
+        context,
+        max_length=MAX_SEQ_LEN,
+        truncation="only_second",
+        return_offsets_mapping=True,
+        return_tensors="pt",
+    )
+    offsets = inputs.pop("offset_mapping")[0].tolist()
+    sequence_ids = inputs.sequence_ids(0)
+
+    with torch.no_grad():
+        outputs = model(**inputs)
+    start_logits = outputs.start_logits[0].tolist()
+    end_logits = outputs.end_logits[0].tolist()
+
+    null_score = start_logits[0] + end_logits[0]
+
+    context_positions = [i for i, sid in enumerate(sequence_ids) if sid == 1]
+    if not context_positions:
+        return "", 0.0
+    context_position_set = set(context_positions)
+    last_context_pos = context_positions[-1]
+
+    best_score = null_score
+    best_span = None
+    for start in context_positions:
+        s_logit = start_logits[start]
+        for end in range(start, min(start + MAX_ANSWER_TOKENS, last_context_pos + 1)):
+            if end not in context_position_set:
+                continue
+            score = s_logit + end_logits[end]
+            if score > best_score:
+                best_score = score
+                best_span = (start, end)
+
+    confidence = 1 / (1 + math.exp(-(best_score - null_score)))
+
+    if best_span is None:
+        return "", confidence
+
+    char_start = offsets[best_span[0]][0]
+    char_end = offsets[best_span[1]][1]
+    return context[char_start:char_end], confidence
+
+
+def _classify_one(clause: dict, tokenizer, model) -> str:
     context = clause["text"][:MAX_CONTEXT_CHARS]
     best_category = None
     best_score = 0.0
@@ -171,19 +262,15 @@ def _classify_one(clause: dict, qa_pipeline) -> str:
     for category, questions in CUAD_QUESTIONS.items():
         for question in questions:
             try:
-                result = qa_pipeline(
-                    question=question,
-                    context=context,
-                    handle_impossible_answer=True,
-                )
+                answer, score = _answer_question(question, context, tokenizer, model)
             except Exception as e:
                 logger.warning(
                     "classify: QA call failed for %s / %r: %s", clause["clause_id"], category, e
                 )
                 continue
 
-            if result.get("answer") and result["score"] > best_score:
-                best_score = result["score"]
+            if answer and score > best_score:
+                best_score = score
                 best_category = category
 
     if best_category is not None and best_score >= CONFIDENCE_THRESHOLD:
@@ -200,9 +287,9 @@ def classify_clauses(clauses: list, cost_tracker=None) -> dict:
     returning "Other" for every clause — a systemic setup failure should be
     loud, not indistinguishable from a real (if boring) classification
     result."""
-    qa_pipeline = _load_pipeline()
+    tokenizer, model = _load_model()
 
-    results = {clause["clause_id"]: _classify_one(clause, qa_pipeline) for clause in clauses}
+    results = {clause["clause_id"]: _classify_one(clause, tokenizer, model) for clause in clauses}
 
     if clauses:
         other_count = sum(1 for v in results.values() if v == "Other")
