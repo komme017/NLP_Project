@@ -157,7 +157,14 @@ CUAD_QUESTIONS = {
 # assert against in tests.
 CUAD_UNSUPPORTED_CATEGORIES = sorted(set(CATEGORIES) - {"Other"} - set(CUAD_QUESTIONS))
 
-CONFIDENCE_THRESHOLD = 0.5
+# The main lever for "too many clauses land on Other" -- 0.5 means "the
+# best category's answer span is exactly as confident as the model's own
+# null-answer score", which is a reasonable default but not an empirically
+# tuned number. Lower it (e.g. 0.3) to let more borderline matches through
+# at the cost of more low-confidence/wrong category picks; raise it to be
+# stricter. Configurable via env var so this doesn't need a code edit to
+# tune against a real contract.
+CONFIDENCE_THRESHOLD = float(os.environ.get("CUAD_CONFIDENCE_THRESHOLD", "0.5"))
 OTHER_RATE_WARNING_THRESHOLD = 0.9
 
 
