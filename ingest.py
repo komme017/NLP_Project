@@ -2,14 +2,17 @@
 
 import io
 
-from pypdf import PdfReader
-
 
 def load_txt(file_bytes: bytes) -> str:
     return file_bytes.decode("utf-8", errors="replace")
 
 
 def load_pdf(file_bytes: bytes) -> str:
+    # Imported lazily so a broken/missing pypdf install (or its optional
+    # crypto backend) can't break .txt-only usage, which is the primary
+    # path for this prototype.
+    from pypdf import PdfReader
+
     reader = PdfReader(io.BytesIO(file_bytes))
     pages = [page.extract_text() or "" for page in reader.pages]
     return "\n\n".join(pages)

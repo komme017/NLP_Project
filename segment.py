@@ -44,16 +44,26 @@ MIN_HEADINGS_FOR_SPLIT = 3
 
 
 def _split_on_pattern(text: str, pattern: re.Pattern):
+    """Return (heading, body, span_start, span_end) tuples, or None if too
+    few headings were found. span covers the heading line through the end
+    of its body, in original-text offsets — used to splice highlights back
+    into the full document for display."""
     matches = list(pattern.finditer(text))
     if len(matches) < MIN_HEADINGS_FOR_SPLIT:
         return None
     segments = []
     for i, m in enumerate(matches):
         heading = m.group(1).strip()
-        start = m.end()
-        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
-        body = text[start:end].strip()
-        segments.append((heading, body))
+        raw_start = m.end()
+        raw_end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        raw = text[raw_start:raw_end]
+        body = raw.strip()
+        # raw was stripped to get body — find where the stripped content
+        # actually starts/ends in the original text so the span (used for
+        # highlighting) doesn't include the whitespace we just threw away.
+        content_start = raw_start + (len(raw) - len(raw.lstrip()))
+        content_end = content_start + len(body) if body else m.end()
+        segments.append((heading, body, m.start(), content_end))
     return segments
 
 
@@ -62,21 +72,37 @@ def _split_on_headings(text: str):
 
 
 def _split_on_paragraphs(text: str):
-    paras = re.split(r"\n\s*\n", text)
+    """Return (heading, body, span_start, span_end) tuples using blank-line
+    paragraph breaks as delimiters, tracking original-text offsets."""
+    sep_re = re.compile(r"\n\s*\n")
     segments = []
-    for p in paras:
-        p = p.strip()
-        if not p:
-            continue
-        heading = p.split("\n")[0][:80].strip()
-        segments.append((heading, p))
+    pos = 0
+    boundaries = [m.start() for m in sep_re.finditer(text)] + [len(text)]
+    for boundary in boundaries:
+        raw = text[pos:boundary]
+        stripped = raw.strip()
+        if stripped:
+            lstrip_len = len(raw) - len(raw.lstrip())
+            span_start = pos + lstrip_len
+            span_end = span_start + len(stripped)
+            heading = stripped.split("\n")[0][:80].strip()
+            segments.append((heading, stripped, span_start, span_end))
+        pos = boundary
+        # advance past the blank-line separator itself, if any, so the next
+        # paragraph's span doesn't start mid-separator
+        sep_match = sep_re.match(text, pos)
+        if sep_match:
+            pos = sep_match.end()
     return segments
 
 
 def segment_contract(text: str):
     """Return (clauses, stats).
 
-    clauses is a list of {clause_id, heading, text}.
+    clauses is a list of {clause_id, heading, text, start, end}. start/end
+    are character offsets into the original text spanning the clause
+    (heading line through body), so callers can splice highlights back into
+    the full document for display.
     stats reports the split method used and what fraction of the source
     document survived into a clause vs. was discarded as boilerplate.
     """
@@ -89,7 +115,7 @@ def segment_contract(text: str):
 
     total_chars = len(text)
     kept = []
-    for heading, body in segments:
+    for heading, body, span_start, span_end in segments:
         if len(body) < MIN_CLAUSE_CHARS:
             continue
         kept.append(
@@ -97,6 +123,8 @@ def segment_contract(text: str):
                 "clause_id": f"c{len(kept) + 1}",
                 "heading": heading or f"Clause {len(kept) + 1}",
                 "text": body,
+                "start": span_start,
+                "end": span_end,
             }
         )
 

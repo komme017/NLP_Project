@@ -60,6 +60,24 @@ class TestSegment(unittest.TestCase):
         self.assertEqual(stats["method"], "paragraph")
         self.assertEqual(len(clauses), 3)
 
+    def test_spans_round_trip_to_original_text_and_dont_overlap(self):
+        text = (
+            "ARTICLE 1 DEFINITIONS\n" + ("x" * 300) + "\n\n"
+            "ARTICLE 2 TERM\n" + ("y" * 300) + "\n\n"
+            "ARTICLE 3 MISC\n" + ("z" * 300)
+        )
+        clauses, _ = segment.segment_contract(text)
+        for c in clauses:
+            self.assertGreaterEqual(c["start"], 0)
+            self.assertLessEqual(c["end"], len(text))
+            self.assertLess(c["start"], c["end"])
+            # the clause's extracted body must appear verbatim within its
+            # own span of the original text (span may also include the
+            # heading line, so this is a substring check, not equality)
+            self.assertIn(c["text"], text[c["start"] : c["end"]])
+        for a, b in zip(clauses, clauses[1:]):
+            self.assertLessEqual(a["end"], b["start"])
+
 
 class TestClassify(unittest.TestCase):
     def test_valid_batch_response_used_directly(self):

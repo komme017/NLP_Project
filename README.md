@@ -24,14 +24,24 @@ AZURE_OPENAI_DEPLOYMENT   # gpt-4.1-mini
 AZURE_OPENAI_API_VERSION  # 2024-10-21
 ```
 
+## Two UI variants
+
+- **`app.py`** — flat, sortable list of results (one expander per clause).
+- **`app_2.py`** (`streamlit run app_2.py`) — shows the full contract text
+  with flagged clauses highlighted inline (severity color-coded), plus a
+  flag picker in a side panel. Selecting a flag scrolls the document pane
+  to that clause and outlines it. Both variants share the same pipeline
+  (`ingest`/`segment`/`classify`/`analyze`/`costs`) and only differ in
+  `render_*`/rendering code.
+
 ## Pipeline
 
 Each stage is a separate module so it can be run/tested in isolation:
 
 | Module | Responsibility |
 |---|---|
-| `ingest.py` | Load `.txt` or `.pdf` contract text |
-| `segment.py` | Heuristic clause segmentation (heading regex, paragraph fallback) |
+| `ingest.py` | Load `.txt` or `.pdf` contract text (pypdf is imported lazily, inside `load_pdf`, so a broken/missing PDF crypto backend can't break plain `.txt` uploads — hit this for real in a sandboxed env, see commit history) |
+| `segment.py` | Heuristic clause segmentation (heading regex, paragraph fallback); each returned clause also carries `start`/`end` character offsets into the original text, which `app_2.py` uses to splice highlights into the full document |
 | `classify.py` | Batched LLM classification into 8 categories + "Other" |
 | `baselines.py` | Hand-written market-standard clause per category |
 | `analyze.py` | LLM deviation analysis: severity, explanation, suggested redline |
