@@ -2,8 +2,8 @@
 
 Same pipeline as app.py, but instead of a flat list of expandable results,
 this shows the full contract text with flagged clauses highlighted inline.
-Flags are listed in a side panel; clicking one scrolls the document pane to
-that clause and outlines it.
+Flags are picked from a dropdown in the sidebar; picking one scrolls the
+document pane to that clause and outlines it.
 """
 
 import html
@@ -49,7 +49,7 @@ SEVERITY_HIGHLIGHT_BORDER = {
     "none": "#16a34a",
     None: "#6b7280",
 }
-DOC_VIEW_HEIGHT_PX = 650
+DOC_VIEW_HEIGHT_PX = 700
 
 
 def run_pipeline(file_bytes: bytes, filename: str):
@@ -172,51 +172,55 @@ def scroll_to_clause(clause_id: str):
     )
 
 
-def render_document_and_flags(run_output):
+def render_flags_sidebar(run_output) -> str:
+    """Flag picker + detail panel, in the sidebar. Returns the selected
+    clause_id (or None if there's nothing to flag), which the document view
+    uses to decide what to highlight/scroll to."""
     results = run_output["results"]
-    clauses = run_output["clauses"]
     results_by_id = {r["clause_id"]: r for r in results}
 
     flags = [r for r in results if is_flag(r)]
     flags = sorted(flags, key=lambda r: SEVERITY_ORDER.get(r["severity"], 4))
 
-    doc_col, flag_col = st.columns([3, 2])
+    st.sidebar.subheader("Flags")
+    if not flags:
+        st.sidebar.success("No deviations flagged — every clause matched its baseline.")
+        return None
 
-    with flag_col:
-        st.markdown("**Flags**")
-        if not flags:
-            st.success("No deviations flagged — every clause matched its baseline.")
-            selected_id = None
-        else:
-            options = [r["clause_id"] for r in flags]
-            labels = {
-                r["clause_id"]: f"[{SEVERITY_LABEL[r['severity']]}] {r['heading'][:45]} · {r['category']}"
-                for r in flags
-            }
-            selected_id = st.radio(
-                "Select a flag to jump to it in the document",
-                options=options,
-                format_func=lambda cid: labels[cid],
-                label_visibility="collapsed",
-            )
+    options = [r["clause_id"] for r in flags]
+    labels = {
+        r["clause_id"]: f"[{SEVERITY_LABEL[r['severity']]}] {r['heading'][:45]} · {r['category']}"
+        for r in flags
+    }
+    selected_id = st.sidebar.selectbox(
+        f"{len(flags)} flagged clause(s) — pick one to jump to it",
+        options=options,
+        format_func=lambda cid: labels[cid],
+    )
 
-            selected = results_by_id[selected_id]
-            st.markdown(f"**Category:** {selected['category']}")
-            st.markdown(
-                f":{SEVERITY_COLOR.get(selected['severity'])}[**{SEVERITY_LABEL[selected['severity']]}**]"
-            )
-            st.markdown(f"**Explanation:** {selected['explanation']}")
-            if selected["show_redline"]:
-                st.markdown("**Suggested redline:**")
-                st.code(selected["suggested_redline"], language=None)
-            else:
-                st.warning(selected["review_message"])
-            st.caption(f"Confidence: {selected['confidence']} · Status: {selected['status']}")
+    selected = results_by_id[selected_id]
+    st.sidebar.markdown(
+        f":{SEVERITY_COLOR.get(selected['severity'])}[**{SEVERITY_LABEL[selected['severity']]}**] "
+        f"· {selected['category']}"
+    )
+    st.sidebar.markdown(f"**Explanation:** {selected['explanation']}")
+    if selected["show_redline"]:
+        st.sidebar.markdown("**Suggested redline:**")
+        st.sidebar.code(selected["suggested_redline"], language=None)
+    else:
+        st.sidebar.warning(selected["review_message"])
+    st.sidebar.caption(f"Confidence: {selected['confidence']} · Status: {selected['status']}")
 
-    with doc_col:
-        st.markdown("**Document** (scroll or pick a flag to jump)")
-        doc_html = build_highlighted_document_html(run_output["text"], clauses, results_by_id, selected_id)
-        st.markdown(doc_html, unsafe_allow_html=True)
+    return selected_id
+
+
+def render_document(run_output, selected_id: str):
+    results_by_id = {r["clause_id"]: r for r in run_output["results"]}
+    st.markdown("**Document** (scroll, or pick a flag in the sidebar to jump)")
+    doc_html = build_highlighted_document_html(
+        run_output["text"], run_output["clauses"], results_by_id, selected_id
+    )
+    st.markdown(doc_html, unsafe_allow_html=True)
 
     if selected_id is not None:
         scroll_to_clause(selected_id)
@@ -240,8 +244,8 @@ def main():
     st.title("Redline — Document View")
     st.caption(
         "Upload an inbound third-party contract to see the full text with "
-        "flagged clauses highlighted inline. Pick a flag on the right to "
-        "scroll the document to it."
+        "flagged clauses highlighted inline. Pick a flag from the sidebar "
+        "dropdown to scroll the document to it."
     )
 
     with st.expander("Taxonomy covered"):
@@ -261,7 +265,8 @@ def main():
         st.divider()
         st.subheader(f"Results — {st.session_state.get('contract_name', '')}")
         render_summary(run_output["results"])
-        render_document_and_flags(run_output)
+        selected_id = render_flags_sidebar(run_output)
+        render_document(run_output, selected_id)
         render_costs(run_output["cost_totals"])
 
 
