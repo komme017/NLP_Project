@@ -1,143 +1,199 @@
-"""Clause classification: assign each clause one category from a fixed
-taxonomy by prompting the model. Clauses are batched into a single call
-where possible to cut cost and latency.
+"""Clause classification using a CUAD-fine-tuned RoBERTa QA model, run
+locally (no API calls) — see https://github.com/The-Atticus-Project/cuad.
+
+## Why this looks different from a normal classifier
+
+CUAD's released checkpoint isn't a sequence classifier over a label set.
+It's trained for extractive QA: given a fixed question like `Highlight the
+parts (if any) of this contract related to "Cap On Liability" that should
+be reviewed by a lawyer. Details: ...` and a contract, it either extracts
+the answering span or (SQuAD2.0-style) says there's no answer. CUAD has 41
+of these fixed category-questions (see CUADv1.json in the repo above); a
+label per clause has to be reverse-engineered by running our candidate
+categories' questions against the clause and taking whichever one the model
+answers most confidently.
+
+# NOTE: CUAD's 41 categories do not cover this product's taxonomy 1:1.
+# Only 5 of our 8 categories have a reasonable CUAD analog (see
+# CUAD_QUESTIONS below — Termination maps to the narrower "Termination For
+# Convenience", Warranty to the narrower "Warranty Duration", Limitation of
+# Liability to the OR of "Cap On Liability"/"Uncapped Liability"). Indemnification,
+# Confidentiality, and Payment Terms have no CUAD question at all — CUAD
+# just never asked about them — so clauses of those types can *never* be
+# predicted by this model and always fall through to "Other". That's a
+# structural ceiling on this approach, not a bug: if you see every
+# Indemnification/Confidentiality/Payment Terms clause landing in "Other",
+# this is why. (This is very likely what was actually happening if
+# *everything* showed up unclassified before — worth checking the 90%+
+# Other-rate warning logged below to rule out a genuine load failure too.)
+
+## Why classification used to fail with everything unclassified
+
+The most common cause of every clause landing on "N/A"/"Other" is the model
+failing to load (wrong CUAD_MODEL_PATH, missing weights, missing torch) and
+that failure getting silently absorbed somewhere upstream. This module
+raises loudly instead — if the model can't load, classify_clauses raises
+RuntimeError with an actionable message rather than quietly returning
+"Other" for every clause and looking like a classification result.
 """
 
-import json
+import functools
 import logging
+import os
 
 from baselines import CATEGORIES
-from llm_client import get_client, get_deployment
-from parsing import extract_json
 
 logger = logging.getLogger(__name__)
 
-BATCH_SIZE = 8
-# Classification only needs to recognize the clause type, not reason over
-# every word — truncating keeps batched prompts small. Full clause text is
-# preserved elsewhere for the analysis stage.
-CLASSIFY_CHARS = 600
+# Point this at wherever the actual checkpoint lives. The official weights
+# are distributed from Zenodo (linked in the repo's README); this sandbox's
+# network policy blocks both zenodo.org and huggingface.co, so the model
+# can't be fetched automatically here — download it wherever you have
+# network access and either point CUAD_MODEL_PATH at the local directory,
+# or set it to a Hugging Face Hub id if your environment can reach the Hub.
+CUAD_MODEL_PATH = os.environ.get("CUAD_MODEL_PATH", "./models/roberta-base-cuad")
 
-SYSTEM_PROMPT = (
-    "You are a contract clause classifier for a legal review tool. "
-    "Assign each clause exactly one category from this fixed list, and "
-    "nothing else:\n"
-    + "\n".join(f"- {c}" for c in CATEGORIES)
-    + "\nIf a clause does not clearly fit one of the specific categories, "
-    "use \"Other\". Respond with ONLY the requested JSON, no commentary, "
-    "no markdown fences."
-)
+# clause text this long already gives the QA model enough context; the
+# pipeline's own doc_stride/max_seq_len handle anything longer via sliding
+# windows, this just keeps very large clauses from being needlessly slow.
+MAX_CONTEXT_CHARS = 4000
+
+# category -> one or more CUAD question strings (verbatim from CUADv1.json,
+# since exact phrasing is what the model was trained on). Multiple
+# questions per category are OR'd together — the clause is assigned that
+# category if *either* question gets a confident answer.
+CUAD_QUESTIONS = {
+    "Governing Law": [
+        'Highlight the parts (if any) of this contract related to "Governing Law" that '
+        "should be reviewed by a lawyer. Details: Which state/country's law governs the "
+        "interpretation of the contract?"
+    ],
+    "Termination": [
+        'Highlight the parts (if any) of this contract related to "Termination For '
+        'Convenience" that should be reviewed by a lawyer. Details: Can a party terminate '
+        "this  contract without cause (solely by giving a notice and allowing a waiting  "
+        "period to expire)?"
+    ],
+    "Limitation of Liability": [
+        'Highlight the parts (if any) of this contract related to "Cap On Liability" that '
+        "should be reviewed by a lawyer. Details: Does the contract include a cap on "
+        "liability upon the breach of a party’s obligation? This includes time "
+        "limitation for the counterparty to bring claims or maximum amount for recovery.",
+        'Highlight the parts (if any) of this contract related to "Uncapped Liability" that '
+        "should be reviewed by a lawyer. Details: Is a party’s liability uncapped upon "
+        "the breach of its obligation in the contract? This also includes uncap liability "
+        "for a particular type of breach such as IP infringement or breach of "
+        "confidentiality obligation.",
+    ],
+    "Intellectual Property Assignment": [
+        'Highlight the parts (if any) of this contract related to "Ip Ownership Assignment" '
+        "that should be reviewed by a lawyer. Details: Does intellectual property created  "
+        "by one party become the property of the counterparty, either per the terms of the "
+        "contract or upon the occurrence of certain events?"
+    ],
+    "Warranty": [
+        'Highlight the parts (if any) of this contract related to "Warranty Duration" that '
+        "should be reviewed by a lawyer. Details: What is the duration of any  warranty "
+        "against defects or errors in technology, products, or services  provided under "
+        "the contract?"
+    ],
+}
+
+# Categories in our taxonomy CUAD has no question for at all — see module
+# docstring. Listed explicitly (rather than just being absent from
+# CUAD_QUESTIONS) so the "structurally unsupported" set is easy to find and
+# assert against in tests.
+CUAD_UNSUPPORTED_CATEGORIES = sorted(set(CATEGORIES) - {"Other"} - set(CUAD_QUESTIONS))
+
+CONFIDENCE_THRESHOLD = 0.5
+OTHER_RATE_WARNING_THRESHOLD = 0.9
 
 
-def _chunks(items, size):
-    for i in range(0, len(items), size):
-        yield items[i : i + size]
+@functools.lru_cache(maxsize=1)
+def _load_pipeline():
+    from transformers import pipeline
 
-
-def _classify_batch(batch, cost_tracker=None) -> dict:
-    payload = [
-        {
-            "clause_id": c["clause_id"],
-            "heading": c["heading"],
-            "text": c["text"][:CLASSIFY_CHARS],
-        }
-        for c in batch
-    ]
-    user_prompt = (
-        "Classify each of these clauses. Return a JSON object mapping each "
-        "clause_id to its category string, e.g. "
-        '{"c1": "Termination", "c2": "Other"}.\n\n'
-        f"Clauses:\n{json.dumps(payload, indent=2)}"
-    )
-
-    client = get_client()
-    deployment = get_deployment()
-    response = client.chat.completions.create(
-        model=deployment,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt},
-        ],
-        temperature=0,
-    )
-
-    if cost_tracker is not None:
-        usage = response.usage
-        cost_tracker.log_call(
-            stage="classify",
-            model=deployment,
-            prompt_tokens=usage.prompt_tokens,
-            completion_tokens=usage.completion_tokens,
+    # If CUAD_MODEL_PATH looks like a local path (the default is), a missing
+    # directory should fail immediately -- letting transformers/huggingface_hub
+    # treat it as a Hub id instead means a network resolution attempt with
+    # its own retry/backoff, which can hang for minutes in an environment
+    # with no route to huggingface.co before finally producing the same
+    # "not found" conclusion. Only genuine Hub ids (no local-path prefix)
+    # fall through to the real network attempt below.
+    looks_like_local_path = CUAD_MODEL_PATH.startswith((".", "/", "~"))
+    if looks_like_local_path and not os.path.isdir(CUAD_MODEL_PATH):
+        raise RuntimeError(
+            f"CUAD_MODEL_PATH={CUAD_MODEL_PATH!r} looks like a local path but that "
+            "directory doesn't exist. Download the checkpoint from the Zenodo link in "
+            "https://github.com/The-Atticus-Project/cuad and point CUAD_MODEL_PATH at "
+            "the extracted directory (or set it to a Hugging Face Hub id instead)."
         )
 
-    raw = response.choices[0].message.content
     try:
-        parsed = extract_json(raw)
-        if not isinstance(parsed, dict):
-            raise ValueError("expected a JSON object")
-        return parsed
-    except (json.JSONDecodeError, ValueError):
-        logger.warning("classify: could not parse batch response, will retry per-clause: %r", raw)
-        return {}
+        return pipeline("question-answering", model=CUAD_MODEL_PATH, tokenizer=CUAD_MODEL_PATH)
+    except Exception as e:
+        raise RuntimeError(
+            f"Could not load the CUAD QA model from CUAD_MODEL_PATH={CUAD_MODEL_PATH!r}: {e}. "
+            "Download the checkpoint from the Zenodo link in "
+            "https://github.com/The-Atticus-Project/cuad and set CUAD_MODEL_PATH to the "
+            "local directory (or a reachable Hugging Face Hub id)."
+        ) from e
 
 
-def _classify_single(clause, cost_tracker=None):
-    """Retry path for a clause that came back with an invalid/missing
-    category. Asks for just the bare category name."""
-    user_prompt = (
-        "Classify this single contract clause. Reply with ONLY the category "
-        "name from the list, nothing else.\n\n"
-        f"Heading: {clause['heading']}\n"
-        f"Text: {clause['text'][:CLASSIFY_CHARS]}"
-    )
-    client = get_client()
-    deployment = get_deployment()
-    response = client.chat.completions.create(
-        model=deployment,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt},
-        ],
-        temperature=0,
-    )
+def _classify_one(clause: dict, qa_pipeline) -> str:
+    context = clause["text"][:MAX_CONTEXT_CHARS]
+    best_category = None
+    best_score = 0.0
 
-    if cost_tracker is not None:
-        usage = response.usage
-        cost_tracker.log_call(
-            stage="classify_retry",
-            model=deployment,
-            prompt_tokens=usage.prompt_tokens,
-            completion_tokens=usage.completion_tokens,
-        )
-
-    raw = response.choices[0].message.content.strip()
-    for category in CATEGORIES:
-        if raw.lower() == category.lower():
-            return category
-    return None
-
-
-def classify_clauses(clauses, cost_tracker=None) -> dict:
-    """Return {clause_id: category} for every clause. Unparseable or
-    off-taxonomy responses fall back to a single-clause retry, then to
-    "Other" — never left unclassified and never allowed to crash the run."""
-    results: dict = {}
-    for batch in _chunks(clauses, BATCH_SIZE):
-        batch_result = _classify_batch(batch, cost_tracker)
-        for clause_id, category in batch_result.items():
-            if category in CATEGORIES:
-                results[clause_id] = category
-            else:
-                logger.warning(
-                    "classify: batch returned off-taxonomy category %r for %s", category, clause_id
+    for category, questions in CUAD_QUESTIONS.items():
+        for question in questions:
+            try:
+                result = qa_pipeline(
+                    question=question,
+                    context=context,
+                    handle_impossible_answer=True,
                 )
+            except Exception as e:
+                logger.warning(
+                    "classify: QA call failed for %s / %r: %s", clause["clause_id"], category, e
+                )
+                continue
 
-    for clause in clauses:
-        cid = clause["clause_id"]
-        if cid not in results:
-            retried = _classify_single(clause, cost_tracker)
-            results[cid] = retried if retried in CATEGORIES else "Other"
-            if retried is None:
-                logger.warning("classify: %s could not be classified, defaulting to Other", cid)
+            if result.get("answer") and result["score"] > best_score:
+                best_score = result["score"]
+                best_category = category
+
+    if best_category is not None and best_score >= CONFIDENCE_THRESHOLD:
+        return best_category
+    return "Other"
+
+
+def classify_clauses(clauses: list, cost_tracker=None) -> dict:
+    """Return {clause_id: category}. cost_tracker is accepted for interface
+    compatibility with the previous Azure-based classifier (app.py/app_2.py
+    both pass it) but unused here — this model runs locally, no API cost.
+
+    Raises RuntimeError if the model can't be loaded, rather than silently
+    returning "Other" for every clause — a systemic setup failure should be
+    loud, not indistinguishable from a real (if boring) classification
+    result."""
+    qa_pipeline = _load_pipeline()
+
+    results = {clause["clause_id"]: _classify_one(clause, qa_pipeline) for clause in clauses}
+
+    if clauses:
+        other_count = sum(1 for v in results.values() if v == "Other")
+        other_rate = other_count / len(clauses)
+        if other_rate > OTHER_RATE_WARNING_THRESHOLD:
+            logger.warning(
+                "classify: %d/%d clauses (%.0f%%) classified as Other. Expected for "
+                "Indemnification/Confidentiality/Payment Terms clauses (CUAD has no "
+                "question for those categories — see module docstring), but if this "
+                "contract shouldn't be almost all Other, check CUAD_MODEL_PATH is "
+                "actually loading real weights.",
+                other_count,
+                len(clauses),
+                other_rate * 100,
+            )
 
     return results

@@ -72,7 +72,15 @@ def run_pipeline(file_bytes: bytes, filename: str):
         return None
 
     status.write(f"Classifying {len(clauses)} clauses...")
-    categories = classify_clauses(clauses, cost_tracker)
+    try:
+        categories = classify_clauses(clauses, cost_tracker)
+    except RuntimeError as e:
+        # classify.py raises loudly (rather than quietly returning "Other"
+        # for everything) when the local CUAD model can't be loaded -- show
+        # that clearly instead of a raw traceback.
+        status.update(label="Classification failed.", state="error")
+        st.error(str(e))
+        return None
 
     status.write("Comparing each clause against market baselines...")
     results = analyze_clauses(clauses, categories, cost_tracker)
@@ -235,8 +243,10 @@ def render_costs(cost_totals):
     c3.metric("Completion tokens", f"{cost_totals['completion_tokens']:,}")
     c4.metric("Estimated cost", f"${cost_totals['estimated_cost_usd']:.4f}")
     st.caption(
-        "Estimated using published commercial per-token rates (see costs.py). "
-        "Azure access for this project is institutional/free."
+        "Covers analysis (gpt-4.1-mini) calls only — classification runs locally "
+        "against a CUAD-fine-tuned model, no API cost. Estimated using published "
+        "commercial per-token rates (see costs.py). Azure access for this project "
+        "is institutional/free."
     )
 
 

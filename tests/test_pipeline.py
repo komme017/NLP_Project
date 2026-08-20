@@ -79,42 +79,64 @@ class TestSegment(unittest.TestCase):
             self.assertLessEqual(a["end"], b["start"])
 
 
-class TestClassify(unittest.TestCase):
-    def test_valid_batch_response_used_directly(self):
-        clauses = [
-            {"clause_id": "c1", "heading": "Term", "text": "x" * 250},
-            {"clause_id": "c2", "heading": "Governing Law", "text": "y" * 250},
-        ]
-        client = FakeClient([fake_response(json.dumps({"c1": "Termination", "c2": "Governing Law"}))])
-        with patch("classify.get_client", return_value=client), patch(
-            "classify.get_deployment", return_value="gpt-4.1-mini"
-        ):
-            result = classify.classify_clauses(clauses)
-        self.assertEqual(result, {"c1": "Termination", "c2": "Governing Law"})
+class FakeQAPipeline:
+    """Stand-in for the transformers QA pipeline. Matched by substring
+    against the (verbatim CUAD) question text, so tests don't have to
+    reproduce the full question strings — just enough to identify which
+    CUAD category question is being asked."""
 
-    def test_garbage_batch_falls_back_to_per_clause_then_other(self):
-        clauses = [{"clause_id": "c1", "heading": "???", "text": "x" * 250}]
-        # batch call returns unparseable garbage, single-clause retry also garbage
-        client = FakeClient([fake_response("not json at all"), fake_response("Not A Real Category")])
-        with patch("classify.get_client", return_value=client), patch(
-            "classify.get_deployment", return_value="gpt-4.1-mini"
-        ):
+    def __init__(self, rules):
+        # rules: list of (question_substring, answer, score)
+        self.rules = rules
+
+    def __call__(self, question, context, handle_impossible_answer=True):
+        for substr, answer, score in self.rules:
+            if substr in question:
+                return {"answer": answer, "score": score, "start": 0, "end": len(answer)}
+        return {"answer": "", "score": 0.0, "start": 0, "end": 0}
+
+
+class TestClassify(unittest.TestCase):
+    def test_confident_match_assigns_mapped_category(self):
+        clauses = [{"clause_id": "c1", "heading": "Gov Law", "text": "x" * 250}]
+        pipeline = FakeQAPipeline([("Governing Law", "Delaware law applies", 0.92)])
+        with patch("classify._load_pipeline", return_value=pipeline):
+            result = classify.classify_clauses(clauses)
+        self.assertEqual(result, {"c1": "Governing Law"})
+
+    def test_below_confidence_threshold_falls_to_other(self):
+        clauses = [{"clause_id": "c1", "heading": "Ambiguous", "text": "x" * 250}]
+        pipeline = FakeQAPipeline([("Governing Law", "maybe Delaware", 0.2)])
+        with patch("classify._load_pipeline", return_value=pipeline):
             result = classify.classify_clauses(clauses)
         self.assertEqual(result, {"c1": "Other"})
 
-    def test_off_taxonomy_category_falls_back_to_retry(self):
-        clauses = [{"clause_id": "c1", "heading": "Odd", "text": "x" * 250}]
-        client = FakeClient(
-            [
-                fake_response(json.dumps({"c1": "Made Up Category"})),
-                fake_response("Confidentiality"),
-            ]
-        )
-        with patch("classify.get_client", return_value=client), patch(
-            "classify.get_deployment", return_value="gpt-4.1-mini"
-        ):
+    def test_second_question_in_a_multi_question_category_can_win(self):
+        # "Limitation of Liability" maps to two CUAD questions (Cap On
+        # Liability, Uncapped Liability) OR'd together
+        clauses = [{"clause_id": "c1", "heading": "Liability", "text": "x" * 250}]
+        pipeline = FakeQAPipeline([("Uncapped Liability", "no cap stated", 0.75)])
+        with patch("classify._load_pipeline", return_value=pipeline):
             result = classify.classify_clauses(clauses)
-        self.assertEqual(result, {"c1": "Confidentiality"})
+        self.assertEqual(result, {"c1": "Limitation of Liability"})
+
+    def test_categories_with_no_cuad_question_are_structurally_unreachable(self):
+        # CUAD has no question at all for these three categories, so no
+        # matter how the QA model scores, _classify_one can only ever
+        # return "Other" or a key from CUAD_QUESTIONS for a given clause —
+        # these three simply aren't in that dict.
+        self.assertEqual(
+            set(classify.CUAD_UNSUPPORTED_CATEGORIES),
+            {"Indemnification", "Confidentiality", "Payment Terms"},
+        )
+        for unsupported in classify.CUAD_UNSUPPORTED_CATEGORIES:
+            self.assertNotIn(unsupported, classify.CUAD_QUESTIONS)
+
+    def test_model_load_failure_raises_instead_of_silently_defaulting_everyone_to_other(self):
+        clauses = [{"clause_id": "c1", "heading": "Anything", "text": "x" * 250}]
+        with patch("classify._load_pipeline", side_effect=RuntimeError("could not load model")):
+            with self.assertRaises(RuntimeError):
+                classify.classify_clauses(clauses)
 
 
 class TestAnalyze(unittest.TestCase):
