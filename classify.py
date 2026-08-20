@@ -54,7 +54,16 @@ import functools
 import logging
 import os
 
+from dotenv import load_dotenv
+
 from baselines import CATEGORIES
+
+# Loaded here too (not just in llm_client.py) so CUAD_MODEL_PATH below picks
+# up .env regardless of which module happens to be imported first -- this
+# used to only work because analyze.py (which loads it via llm_client) was
+# imported before classify.py in app.py/app_2.py, which is a fragile thing
+# to depend on. load_dotenv() is a no-op if called more than once.
+load_dotenv()
 
 logger = logging.getLogger(__name__)
 
